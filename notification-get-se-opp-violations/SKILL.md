@@ -148,7 +148,7 @@ session.sql(
 
 | Task | Schedule | Status |
 |---|---|---|
-| `TEMP.SEGAL.SE_OPP_VIOLATIONS_TASK` | Every Monday 7am CT (`CRON 0 7 * * 1 America/Chicago`) | **ACTIVE** (resumed 2026-07-27) |
+| `TEMP.SEGAL.SE_OPP_VIOLATIONS_TASK` | Every Monday 4:15pm CT (`CRON 15 16 * * 1 America/Chicago`) | **ACTIVE** — moved from 7am 2026-08-03 (OAuth warm at 4pm) |
 
 ---
 
@@ -321,14 +321,17 @@ Flags: `is`. Snowflake `REGEXP_LIKE` is full-string match — trailing `.*` requ
 
 > **SNOWFLAKE REGEX WARNING:** `\d` and `\s` are **NOT** supported by Snowflake's regex engine and silently return NULL / FALSE. Always use `[0-9]` instead of `\d`, and `[[:space:]]` instead of `\s`. This caused a bug where every opp appeared to have no recent comment (all stale violations fired) and every comment appeared invalid (all V7 fired). Fixed 2026-07-28.
 
-**Most recent comment date extraction** (handles 4-digit and 2-digit years):
+**Most recent comment date extraction** (single unified regex, scoped to first 30 chars):
 ```sql
 COALESCE(
-    TRY_TO_DATE(REGEXP_SUBSTR(SE_COMMENTS_C, '([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})', 1, 1, 'e', 1), 'MM/DD/YYYY'),
-    TRY_TO_DATE(REGEXP_SUBSTR(SE_COMMENTS_C, '([0-9]{1,2}/[0-9]{1,2}/[0-9]{2})', 1, 1, 'e', 1), 'MM/DD/YY')
+    TRY_TO_DATE(REGEXP_SUBSTR(LEFT(SE_COMMENTS_C, 30), '([0-9]{1,4}[/-][0-9]{1,2}[/-][0-9]{2,4})', 1, 1, 'e', 1), 'YYYY-MM-DD'),
+    TRY_TO_DATE(REGEXP_SUBSTR(LEFT(SE_COMMENTS_C, 30), '([0-9]{1,4}[/-][0-9]{1,2}[/-][0-9]{2,4})', 1, 1, 'e', 1), 'MM/DD/YYYY'),
+    TRY_TO_DATE(REGEXP_SUBSTR(LEFT(SE_COMMENTS_C, 30), '([0-9]{1,4}[/-][0-9]{1,2}[/-][0-9]{2,4})', 1, 1, 'e', 1), 'MM/DD/YY')
 )
 ```
-4-digit year tried first. 2-digit fallback handles `07/22/26` style. NULL = no date found (treated as no recent comment).
+Uses `LEFT(SE_COMMENTS_C, 30)` to ensure we only extract the date from the **newest** (topmost) comment entry — not an older ISO-date entry buried further down. The `[/-]` character class matches both slash and dash separators in a single pass. TRY_TO_DATE COALESCE tries ISO first, then MM/DD/YYYY, then MM/DD/YY. NULL = no date found (treated as no recent comment).
+
+> **BUG FIX (2026-08-11):** Previously, ISO format was tried against the *entire* SE_COMMENTS_C field first. When a newer slash-format entry sat at the top but an older ISO entry existed further down, the ISO regex matched the stale date — causing false V5/V6 stale violations. Fixed by scoping to LEFT(..., 30).
 
 ---
 
