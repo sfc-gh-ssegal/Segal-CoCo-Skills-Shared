@@ -253,7 +253,7 @@ snow sql --connection snowhouse_ExtBrowser --role SALES_ENGINEER --warehouse SAL
 
 | SE Name | Email | Initials |
 |---|---|---|
-| Abhinav Bannerjee | abhinav.bannerjee@snowflake.com | AB |
+| Deborah Awe | deborah.awe@snowflake.com | DA |
 | James Newsom | james.newsom@snowflake.com | JN |
 | Julie Heckman | julie.heckman@snowflake.com | JH |
 | Lisa Batteiger | lisa.batteiger@snowflake.com | LB |
@@ -450,7 +450,7 @@ BASE_OPPS AS (
       AND o.AGREEMENT_TYPE_C LIKE 'Capacity%' AND o.TYPE != 'Renewal'
       AND o.NAME NOT ILIKE '%-Segment%'
       AND o.TOTAL_ACV_C > 0
-      AND u.NAME IN ('Abhinav Bannerjee','James Newsom','Julie Heckman',
+      AND u.NAME IN ('Deborah Awe','James Newsom','Julie Heckman',
                      'Lisa Batteiger','Michael Hughes','Stephen Pace',
                      'Tim Whitaker','Whitney Burke')
 )
