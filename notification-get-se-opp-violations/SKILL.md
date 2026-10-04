@@ -5,7 +5,7 @@ description: "Retrieve SE opp violations for SEs on the team and send Slack noti
 
 # SE Opp Violations — Notification Pipeline
 
-Detects pipeline hygiene violations for Steven Segal's 8-person SE team and delivers Slack DMs per SE with SFDC links (grouped by opp), plus a manager summary. Runs every Monday 7am CT.
+Detects pipeline hygiene violations for Steven Segal's 8-person SE team and delivers Slack DMs per SE with SFDC links (grouped by opp), plus a manager summary. Runs every Monday 4:15pm CT.
 
 ---
 
@@ -16,7 +16,10 @@ Detects pipeline hygiene violations for Steven Segal's 8-person SE team and deli
 CALL TEMP.SEGAL.RUN_SE_OPP_VIOLATIONS(TRUE);
 
 -- Run live (messages go to each SE)
-CALL TEMP.SEGAL.RUN_SE_OPP_VIOLATIONS(FALSE);
+CALL TEMP.SEGAL.RUN_SE_OPP_VIOLATIONS(FALSE, NULL);
+
+-- Test a single SE — send their message to Steven only
+CALL TEMP.SEGAL.RUN_SE_OPP_VIOLATIONS(TRUE, 'Whitney');  -- substring match on SE name
 
 -- Just detect violations without sending messages
 CALL TEMP.SEGAL.DETECT_SE_OPP_VIOLATIONS('MANUAL_RUN');
@@ -40,13 +43,13 @@ GROUP BY 1, 2 ORDER BY 2 DESC LIMIT 10;
 
 ### Design Principles
 
-**Fat SP, thin agent.** All intelligence — which violations to flag, who to notify, how to format the message, what link to include — lives in SQL and Python stored procedures. The agent only does what SQL can't: make an HTTP call to Slack. This makes the pipeline deterministic, testable, and cheap to run.
+**Fat SP, no agent.** All intelligence — which violations to flag, who to notify, how to format the message, what link to include — lives in SQL and Python stored procedures. Slack delivery uses `IT.IT_UDFS.ENG_SLACK` (Snowhouse bot) directly via SQL UDF call, with Slack IDs resolved from `IT.IT_EMPLOYEE_ACCOUNT.DIM_EMPLOYEE`. No OAuth dependency — works reliably in unattended tasks.
 
 **Extensible by config table.** Each violation type has a row in `VIOLATION_CONFIG`. Toggling `IS_ACTIVE = FALSE` disables a violation without touching code. Adding a new violation = one INSERT into VIOLATION_CONFIG + one UNION ALL block in the SP.
 
 **Test mode.** `RUN_SE_OPP_VIOLATIONS(TRUE)` sends all SE messages to `steven.segal@snowflake.com` instead of the SE, with `[TEST — Notifications for: SE Name]` prepended so you can preview exactly what each SE will receive.
 
-**One agent call per SE.** The orchestrator loops over SEs and calls the agent once per person. If one SE's Slack send fails, the rest still go through.
+**One ENG_SLACK call per SE.** The orchestrator loops over SEs and calls `IT.IT_UDFS.ENG_SLACK` once per person. If one SE's Slack send fails, the rest still go through.
 
 **Messages grouped by opp.** Each SE gets one Slack DM with opps as headers — all violations for a given opp are listed as sub-bullets so the SE can click the SFDC link and fix everything for that opp in one visit.
 
@@ -65,9 +68,9 @@ Snowflake Task (Monday 7am CT) — ACTIVE
         ├─ 2. SELECT from SE_OPP_VIOLATIONS WHERE RUN_ID = run_id
         │       Groups by SE then by OPP, builds per-SE message with SFDC links
         │
-        └─ 3. For each SE (+ manager summary):
-                DATA_AGENT_RUN('TEMP.SEGAL.MESSAGING_AGENT', payload)
-                  Agent: looks up Slack user by email → sends DM
+        └─ 3. Bulk-resolve emails → Slack IDs via IT.IT_EMPLOYEE_ACCOUNT.DIM_EMPLOYEE
+               For each SE (+ manager summary):
+                IT.IT_UDFS.ENG_SLACK(slack_id, message) → Snowhouse bot → Slack DM
 ```
 
 ### Data Flow
@@ -88,11 +91,14 @@ FIVETRAN.SALESFORCE.ACCOUNT      ──┘        (filters: Capacity, no Renewal
                                Python SP: group by SE → group by OPP
                                Build SFDC hyperlinks for each opp
                                           │
-                               DATA_AGENT_RUN → MESSAGING_AGENT
+                               Bulk email→Slack ID from DIM_EMPLOYEE
                                           │
-                               natoma_-_slack MCP → Slack DM per SE
+                               IT.IT_UDFS.ENG_SLACK(slack_id, msg) per SE
                                + summary DM to manager
 ```
+
+**SE-facing rules reference (GDoc):** https://docs.google.com/document/d/1PTEgnLVRFuy3PL--fc4ejMe3XE4fPSvETBx4pkyWM0M/edit?usp=sharing
+This link is appended to every SE Slack message as "Pipeline Hygiene Rules Reference."
 
 ---
 
@@ -116,39 +122,47 @@ FIVETRAN.SALESFORCE.ACCOUNT      ──┘        (filters: Capacity, no Renewal
 | SP | Language | Purpose |
 |---|---|---|
 | `DETECT_SE_OPP_VIOLATIONS(RUN_ID VARCHAR)` | SQL | Runs all 9 violation queries, INSERTs into SE_OPP_VIOLATIONS. Returns violation count (INTEGER). |
-| `RUN_SE_OPP_VIOLATIONS(TEST_MODE BOOLEAN)` | Snowpark Python | Orchestrator. Calls DETECT, groups by opp, formats messages, calls MESSAGING_AGENT per SE. |
+| `RUN_SE_OPP_VIOLATIONS(TEST_MODE BOOLEAN)` | Snowpark Python | Orchestrator. Calls DETECT, bulk-resolves Slack IDs from DIM_EMPLOYEE, formats messages, sends via ENG_SLACK per SE. |
 
-### Agent
+### Slack Delivery
+
+**No agent.** Slack DMs are sent via the Snowhouse `IT.IT_UDFS.ENG_SLACK` UDF — a bot-token-based SQL UDF that works reliably in unattended tasks with no OAuth expiry.
+
+**Why not NOVA_SLACK_MCP / MESSAGING_AGENT:** `NOVA_SLACK_MCP` requires user OAuth that expires. When the token expires, `DATA_AGENT_RUN` silently returns a refusal text instead of raising an exception. Switched to ENG_SLACK on 2026-08-20.
 
 | Object | Details |
 |---|---|
-| `TEMP.SEGAL.MESSAGING_AGENT` | Cortex Agent — Slack MCP only, no data tools. Reusable for any notification workflow. |
-| MCP Server | `SNOWFLAKE_INTELLIGENCE.MCP.NOVA_SLACK_MCP` |
-| System prompt | "Send messages exactly as provided. Do not modify content. Look up Slack user by email, send DM, return confirmation." |
+| `IT.IT_UDFS.ENG_SLACK(channel VARCHAR, msg VARCHAR)` | Snowhouse bot UDF. `channel` = Slack user ID (not email). Returns VARIANT with `ok: true` on success. `SALES_ENGINEER` has USAGE. |
+| `IT.IT_EMPLOYEE_ACCOUNT.DIM_EMPLOYEE` | Daily snapshot. Columns: `EMAIL`, `SLACK_ID`. Deduplicate: `QUALIFY ROW_NUMBER() OVER (PARTITION BY EMAIL ORDER BY DS DESC) = 1`. |
 
-**Calling the agent from Python:**
+**Sending from Python:**
 ```python
+# Bulk-resolve all recipient emails at start of run
+email_list = ", ".join(f"'{e}'" for e in emails)
+rows = session.sql(f"""
+    SELECT EMAIL, SLACK_ID FROM IT.IT_EMPLOYEE_ACCOUNT.DIM_EMPLOYEE
+    WHERE EMAIL IN ({email_list})
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY EMAIL ORDER BY DS DESC) = 1
+""").collect()
+slack_id_map = {r["EMAIL"]: r["SLACK_ID"] for r in rows if r["SLACK_ID"]}
+
+# Send one DM — note: Snowpark Row uses subscript, not .get()
 import json
-payload = json.dumps({
-    "messages": [{
-        "role": "user",
-        "content": [{"type": "text", "text": f"Send a Slack DM to {email} with:\n\n{message}"}]
-    }]
-})
-# MUST use params= binding — do NOT embed payload in f-string.
-# Snowflake interprets \n in single-quoted SQL strings as real newlines,
-# corrupting the JSON. Bind variables bypass SQL string parsing entirely.
-session.sql(
-    "SELECT SNOWFLAKE.CORTEX.DATA_AGENT_RUN('TEMP.SEGAL.MESSAGING_AGENT', ?) AS resp",
-    params=[payload]
+slack_id = slack_id_map[recipient_email]
+result = session.sql(
+    "SELECT TO_JSON(IT.IT_UDFS.ENG_SLACK(?, ?)) AS resp",
+    params=[slack_id, message]
 ).collect()
+resp = json.loads(result[0]["RESP"])
+ok = isinstance(resp, list) and resp[0].get("ok") is True
 ```
+**Note:** Messages arrive via the "SnowHouse" bot app in Slack, visible under Activity/Apps — not in regular DMs.
 
 ### Task
 
 | Task | Schedule | Status |
 |---|---|---|
-| `TEMP.SEGAL.SE_OPP_VIOLATIONS_TASK` | Every Monday 4:15pm CT (`CRON 15 16 * * 1 America/Chicago`) | **ACTIVE** — moved from 7am 2026-08-03 (OAuth warm at 4pm) |
+| `TEMP.SEGAL.SE_OPP_VIOLATIONS_TASK` | Every Monday 4:15pm CT (`CRON 15 16 * * 1 America/Chicago`) | **ACTIVE** |
 
 ---
 
@@ -188,7 +202,7 @@ snow sql --connection snowhouse_ExtBrowser --role SALES_ENGINEER --warehouse SAL
 **Notes:**
 - `2027-01-31` is a known placeholder TW Date used by multiple SEs. Excluded from V2 to avoid false positives. V8 flags it instead with appropriate urgency.
 - V7 grace period: format violations are only flagged for comments written on or after `2026-07-27` (the date the standard was communicated to the team).
-- Yellow violations (`V8_PLACEHOLDER_TW_YELLOW`) appear in SE messages but are not visually differentiated from Red yet. Future enhancement: `:yellow_circle:` prefix.
+- Yellow violations (`V8_PLACEHOLDER_TW_YELLOW`) show `🟡 •` prefix in SE messages. When *all* an SE's violations are yellow, the message header uses `:large_yellow_circle:` instead of `:red_circle:`.
 
 ---
 
@@ -325,11 +339,13 @@ Flags: `is`. Snowflake `REGEXP_LIKE` is full-string match — trailing `.*` requ
 ```sql
 COALESCE(
     TRY_TO_DATE(REGEXP_SUBSTR(LEFT(SE_COMMENTS_C, 30), '([0-9]{1,4}[/-][0-9]{1,2}[/-][0-9]{2,4})', 1, 1, 'e', 1), 'YYYY-MM-DD'),
-    TRY_TO_DATE(REGEXP_SUBSTR(LEFT(SE_COMMENTS_C, 30), '([0-9]{1,4}[/-][0-9]{1,2}[/-][0-9]{2,4})', 1, 1, 'e', 1), 'MM/DD/YYYY'),
-    TRY_TO_DATE(REGEXP_SUBSTR(LEFT(SE_COMMENTS_C, 30), '([0-9]{1,4}[/-][0-9]{1,2}[/-][0-9]{2,4})', 1, 1, 'e', 1), 'MM/DD/YY')
+    TRY_TO_DATE(REGEXP_SUBSTR(LEFT(SE_COMMENTS_C, 30), '([0-9]{1,4}[/-][0-9]{1,2}[/-][0-9]{2,4})', 1, 1, 'e', 1), 'MM/DD/YY'),
+    TRY_TO_DATE(REGEXP_SUBSTR(LEFT(SE_COMMENTS_C, 30), '([0-9]{1,4}[/-][0-9]{1,2}[/-][0-9]{2,4})', 1, 1, 'e', 1), 'MM/DD/YYYY')
 )
 ```
-Uses `LEFT(SE_COMMENTS_C, 30)` to ensure we only extract the date from the **newest** (topmost) comment entry — not an older ISO-date entry buried further down. The `[/-]` character class matches both slash and dash separators in a single pass. TRY_TO_DATE COALESCE tries ISO first, then MM/DD/YYYY, then MM/DD/YY. NULL = no date found (treated as no recent comment).
+Uses `LEFT(SE_COMMENTS_C, 30)` to ensure we only extract the date from the **newest** (topmost) comment entry — not an older ISO-date entry buried further down. The `[/-]` character class matches both slash and dash separators in a single pass. TRY_TO_DATE COALESCE tries ISO first, then `MM/DD/YY`, then `MM/DD/YYYY`. NULL = no date found (treated as no recent comment).
+
+> **BUG FIX (2026-08-20):** `MM/DD/YYYY` was previously tried before `MM/DD/YY`. Snowflake's `TRY_TO_DATE('08/18/26', 'MM/DD/YYYY')` silently returns `0026-08-18` (year 26 AD) instead of NULL. This made 2-digit-year comments (e.g. `08/18/26`) appear ancient, falsely triggering V5/V6 stale violations. Fixed by putting `MM/DD/YY` first.
 
 > **BUG FIX (2026-08-11):** Previously, ISO format was tried against the *entire* SE_COMMENTS_C field first. When a newer slash-format entry sat at the top but an older ISO entry existed further down, the ISO regex matched the stale date — causing false V5/V6 stale violations. Fixed by scoping to LEFT(..., 30).
 
@@ -342,36 +358,41 @@ Uses `LEFT(SE_COMMENTS_C, 30)` to ensure we only extract the date from the **new
 ```
 [TEST — Notifications for: *Whitney Burke*]    ← test mode only
 
-:red_circle: *Opp Violations — Week of 07/27/2026*
+:red_circle: *Opp Violations — Week of 08/20/2026*
 
 *<https://snowforce.../OPP_ID/view|Versova>* — Close: 08/28, TW: 07/30
   • No Comment in Last 2 Weeks (TW Due <4 Weeks)
-  _Last comment: 07/22/26 [WB] TW: Need to trial an end to end pipeline..._
+  _Last comment: 08/18/26 [WB] TW: ..._
 
 *<https://snowforce.../OPP_ID/view|SureScripts>* — Close: 11/10, TW: 01/31/2027
-  • TW Date is Placeholder (2027-01-31)
+  🟡 • TW Date is Placeholder (2027-01-31)    ← yellow dot for Yellow violations
 ```
+
+Header uses `:large_yellow_circle:` instead of `:red_circle:` when **all** violations for the SE are Yellow.
 
 Each opp is a clickable link to SFDC. All violations for that opp are bullets underneath — the SE can open one opp and fix everything.
 
 ### Manager Summary
 
 ```
-:bar_chart: *SE Violations Summary — 07/27/2026*
-Run: `8B00005933F0` | Mode: `LIVE` | Total: *31 violations* across *7 SEs*
+:bar_chart: *SE Violations Summary — 08/20/2026*
+Run: `8B00005933F0` | Mode: `LIVE` | Total: *55 violations* across *8 SEs*
 
-*Julie Heckman* — 12 violations
+✅ *Julie Heckman* — 12 violations
   • No Comment in Last 4 Weeks: 11
   • No SE Comments: 1
 
-*Michael Hughes* — 10 violations
-  • Invalid SE Comment Format: 8
-  • No SE Comments: 1
-  • TW Date After Close Date: 1
+✅ *Lisa Batteiger* — 3 violations        ← all-yellow SE: 🟡 prefix only
+  🟡 TW Date is Placeholder (2027-01-31): 3
+
+✅ *Stephen Pace* — 5 violations          ← mixed: plain bullet for red, 🟡 for yellow
+  • No TW Date: 2
+  • No Comment in Last 2 Weeks: 1
+  🟡 TW Date is Placeholder (2027-01-31): 2
 ...
 ```
 
-Manager summary groups by SE → violation type (not by opp).
+Manager summary groups by SE → violation type. When yellows exist, red violations use plain `•` (no emoji) and yellow violations use `🟡` prefix. All-red SEs are unchanged.
 
 ---
 
