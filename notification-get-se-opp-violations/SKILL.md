@@ -1,6 +1,6 @@
 ---
 name: notification-get-se-opp-violations
-description: "Retrieve SE opp violations for SEs on the team and send Slack notifications. Checks 9 violation types on Capacity opps (TOTAL_ACV_C > 0, no Segment opps): No TW Date, TW After Close, TW Past NDY, No SE Comments, stale comments, invalid format, and placeholder TW Date. Messages grouped by opp so SE can fix all issues in one click. Triggers: SE violations, opp violations, TW violations, SE comment violations, notify SEs, violation report, check SE opps, opp health check, compliance check, pipeline violations."
+description: "Retrieve SE opp violations for SEs on the team and send Slack notifications. Checks 9 violation types on Capacity opps (TOTAL_ACV_USD > 0, no Segment opps): No TW Date, TW After Close, TW Past NDY, No SE Comments, stale comments, invalid format, and placeholder TW Date. Messages grouped by opp so SE can fix all issues in one click. Triggers: SE violations, opp violations, TW violations, SE comment violations, notify SEs, violation report, check SE opps, opp health check, compliance check, pipeline violations."
 ---
 
 # SE Opp Violations — Notification Pipeline
@@ -60,7 +60,7 @@ Snowflake Task (Monday 7am CT) — ACTIVE
   └── CALL RUN_SE_OPP_VIOLATIONS(FALSE)
         │
         ├─ 1. CALL DETECT_SE_OPP_VIOLATIONS(run_id)   [SQL SP]
-        │       Queries FIVETRAN.SALESFORCE.*
+        │       Queries SNOW_CERTIFIED.SALESFORCE_OPPORTUNITY.DD_SALESFORCE_OPPORTUNITY
         │       Runs all 9 active violation blocks
         │       Each block CROSS JOINs VIOLATION_CONFIG (IS_ACTIVE gate)
         │       INSERT → SE_OPP_VIOLATIONS table
@@ -76,10 +76,12 @@ Snowflake Task (Monday 7am CT) — ACTIVE
 ### Data Flow
 
 ```
-FIVETRAN.SALESFORCE.OPPORTUNITY  ──┐
-FIVETRAN.SALESFORCE.USER         ──┼──► BASE_OPPS CTE
-FIVETRAN.SALESFORCE.ACCOUNT      ──┘        (filters: Capacity, no Renewal,
-                                             no Segment, TOTAL_ACV_C > 0)
+SNOW_CERTIFIED.SALESFORCE_OPPORTUNITY
+  .DD_SALESFORCE_OPPORTUNITY     ──────► BASE_OPPS CTE
+                                         (filters: Capacity, no Renewal,
+                                          no Segment, TOTAL_ACV_USD > 0)
+                                         SE name/email + account name
+                                         denormalized on opp view — no JOINs
                                           │
                                           ▼
                                    9 violation UNION ALL blocks
@@ -238,14 +240,14 @@ snow sql --connection snowhouse_ExtBrowser --role SALES_ENGINEER --warehouse SAL
 ## OPP SCOPE & FILTERS
 
 **Included:**
-- `AGREEMENT_TYPE_C LIKE 'Capacity%'` — all Capacity variants (Cap, Cap-AWS, Cap-Azure, Cap-GCP)
-- `TYPE != 'Renewal'` — excludes TYPE=Renewal opps
-- `NAME NOT ILIKE '%-Segment%'` — excludes future-year deal segments (Segment 2/3/4/5). These are TYPE='New Business' in SFDC but are effectively renewal slices of multi-year deals.
-- `TOTAL_ACV_C > 0` — only opps with a known Total ACV. Same field used by `opp-review-generation` pipeline as TACV. NULL = not yet priced. Segment opps always have NULL TOTAL_ACV_C so this is belt-and-suspenders with the name filter.
-- `IS_CLOSED = FALSE` and `IS_DELETED = FALSE`
-- SE in team of 8 (via `LEAD_SALES_ENGINEER_C → FIVETRAN.SALESFORCE.USER.ID`)
+- `SALESFORCE_OPPORTUNITY_AGREEMENT_TYPE LIKE 'Capacity%'` — all Capacity variants (Cap, Cap-AWS, Cap-Azure, Cap-GCP)
+- `SALESFORCE_OPPORTUNITY_TYPE != 'Renewal'` — excludes TYPE=Renewal opps
+- `SALESFORCE_OPPORTUNITY_NAME NOT ILIKE '%-Segment%'` — excludes future-year deal segments (Segment 2/3/4/5). These are TYPE='New Business' in SFDC but are effectively renewal slices of multi-year deals.
+- `SALESFORCE_OPPORTUNITY_TOTAL_ACV_USD > 0` — only opps with a known Total ACV. Same field used by `opp-review-generation` pipeline as TACV. NULL = not yet priced. Segment opps always have NULL TOTAL_ACV_USD so this is belt-and-suspenders with the name filter.
+- `IS_SALESFORCE_OPPORTUNITY_CLOSED = FALSE` and `IS_SALESFORCE_OPPORTUNITY_DELETED = FALSE`
+- SE in team of 8 (via `SALESFORCE_OPPORTUNITY_LEAD_SOLUTION_ENGINEER_NAME IN (...)` — no USER join needed)
 
-**Excluded:** Technical Services, On Demand, Renewals, Segment 2/3/4/5 opps, unpriced opps (TOTAL_ACV_C = NULL or 0), closed opps.
+**Excluded:** Technical Services, On Demand, Renewals, Segment 2/3/4/5 opps, unpriced opps (TOTAL_ACV_USD = NULL or 0), closed opps.
 
 ---
 
@@ -262,25 +264,25 @@ snow sql --connection snowhouse_ExtBrowser --role SALES_ENGINEER --warehouse SAL
 | Tim Whitaker | tim.whitaker@snowflake.com | TW |
 | Whitney Burke | whitney.burke@snowflake.com | WB |
 
-SE name and email resolved via `JOIN FIVETRAN.SALESFORCE.USER u ON o.LEAD_SALES_ENGINEER_C = u.ID` — always returns `@snowflake.com` for this team.
+SE name and email resolved via `SALESFORCE_OPPORTUNITY_LEAD_SOLUTION_ENGINEER_NAME` / `_EMAIL` columns denormalized on the certified opp view — no USER join needed. Always returns `@snowflake.com` for this team.
 
 ---
 
 ## SFDC FIELD MAPPING
 
-| Field | SFDC Column |
+| Field | SNOW_CERTIFIED Column |
 |---|---|
-| TW status | `TECHNICAL_WIN_C` — values: `'Yes'`, `'No Decision Yet'`, NULL, `'Lost'` |
-| TW Date | `TECHNICAL_WIN_DATE_C` (DATE) |
-| SE Comments | `SE_COMMENTS_C` (TEXT — running log, newest entry prepended at top) |
-| Agreement Type | `AGREEMENT_TYPE_C` |
-| Opp Type | `TYPE` |
-| Close Date | `CLOSE_DATE` |
-| ACV (filter) | `TOTAL_ACV_C` (NUMERIC) — same field as TACV in opp-review-generation. Filter: `TOTAL_ACV_C > 0` |
-| Opp ID (18-char) | `o.ID` — used for SFDC links |
-| SE User ID | `LEAD_SALES_ENGINEER_C` → join `FIVETRAN.SALESFORCE.USER` |
-| SE Email | `FIVETRAN.SALESFORCE.USER.EMAIL` |
-| Account Name | `FIVETRAN.SALESFORCE.ACCOUNT.NAME` |
+| TW status | `SALESFORCE_OPPORTUNITY_TECHNICAL_WIN_STATUS` — values: `'Yes'`, `'No Decision Yet'`, NULL, `'Lost'` |
+| TW Date | `SALESFORCE_OPPORTUNITY_TECHNICAL_WIN_AT` (DATE) |
+| SE Comments | `SALESFORCE_OPPORTUNITY_SALES_ENGINEER_COMMENTS` (TEXT — running log, newest entry prepended at top) |
+| Agreement Type | `SALESFORCE_OPPORTUNITY_AGREEMENT_TYPE` |
+| Opp Type | `SALESFORCE_OPPORTUNITY_TYPE` |
+| Close Date | `SALESFORCE_OPPORTUNITY_CLOSED_AT` |
+| ACV (filter) | `SALESFORCE_OPPORTUNITY_TOTAL_ACV_USD` (NUMERIC) — same field as TACV in opp-review-generation. Filter: `> 0` |
+| Opp ID (18-char) | `SALESFORCE_OPPORTUNITY_ID` — used for SFDC links |
+| SE Name | `SALESFORCE_OPPORTUNITY_LEAD_SOLUTION_ENGINEER_NAME` (denormalized — no USER join) |
+| SE Email | `SALESFORCE_OPPORTUNITY_LEAD_SOLUTION_ENGINEER_EMAIL` (denormalized — no USER join) |
+| Account Name | `SALESFORCE_ACCOUNT_NAME` (denormalized — no ACCOUNT join) |
 
 **SFDC link format:**
 ```
@@ -428,29 +430,33 @@ FQ AS (
     FROM FQ_START
 ),
 BASE_OPPS AS (
-    SELECT u.NAME AS se_name, u.EMAIL AS se_email,
-           a.NAME AS account_name, o.NAME AS opp_name, o.ID AS opp_id,
-           o.CLOSE_DATE, o.TECHNICAL_WIN_C AS tw_status,
-           o.TECHNICAL_WIN_DATE_C AS tw_date, o.SE_COMMENTS_C AS se_comments,
+    SELECT o.SALESFORCE_OPPORTUNITY_LEAD_SOLUTION_ENGINEER_NAME AS se_name,
+           o.SALESFORCE_OPPORTUNITY_LEAD_SOLUTION_ENGINEER_EMAIL AS se_email,
+           o.SALESFORCE_ACCOUNT_NAME AS account_name,
+           o.SALESFORCE_OPPORTUNITY_NAME AS opp_name,
+           o.SALESFORCE_OPPORTUNITY_ID AS opp_id,
+           o.SALESFORCE_OPPORTUNITY_CLOSED_AT AS close_date,
+           o.SALESFORCE_OPPORTUNITY_TECHNICAL_WIN_STATUS AS tw_status,
+           o.SALESFORCE_OPPORTUNITY_TECHNICAL_WIN_AT AS tw_date,
+           o.SALESFORCE_OPPORTUNITY_SALES_ENGINEER_COMMENTS AS se_comments,
            COALESCE(
-               TRY_TO_DATE(REGEXP_SUBSTR(o.SE_COMMENTS_C,'([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})',1,1,'e',1),'MM/DD/YYYY'),
-               TRY_TO_DATE(REGEXP_SUBSTR(o.SE_COMMENTS_C,'([0-9]{1,2}/[0-9]{1,2}/[0-9]{2})',1,1,'e',1),'MM/DD/YY')
+               TRY_TO_DATE(REGEXP_SUBSTR(LEFT(o.SALESFORCE_OPPORTUNITY_SALES_ENGINEER_COMMENTS, 30),'([0-9]{1,4}[/-][0-9]{1,2}[/-][0-9]{2,4})',1,1,'e',1),'YYYY-MM-DD'),
+               TRY_TO_DATE(REGEXP_SUBSTR(LEFT(o.SALESFORCE_OPPORTUNITY_SALES_ENGINEER_COMMENTS, 30),'([0-9]{1,4}[/-][0-9]{1,2}[/-][0-9]{2,4})',1,1,'e',1),'MM/DD/YY'),
+               TRY_TO_DATE(REGEXP_SUBSTR(LEFT(o.SALESFORCE_OPPORTUNITY_SALES_ENGINEER_COMMENTS, 30),'([0-9]{1,4}[/-][0-9]{1,2}[/-][0-9]{2,4})',1,1,'e',1),'MM/DD/YYYY')
            ) AS most_recent_comment_date,
            CASE
-               WHEN o.SE_COMMENTS_C IS NULL OR TRIM(o.SE_COMMENTS_C) = '' THEN 'no_comment'
-               WHEN REGEXP_LIKE(TRIM(o.SE_COMMENTS_C),
+               WHEN o.SALESFORCE_OPPORTUNITY_SALES_ENGINEER_COMMENTS IS NULL OR TRIM(o.SALESFORCE_OPPORTUNITY_SALES_ENGINEER_COMMENTS) = '' THEN 'no_comment'
+               WHEN REGEXP_LIKE(TRIM(o.SALESFORCE_OPPORTUNITY_SALES_ENGINEER_COMMENTS),
                    '^([0-9]{1,2}/[0-9]{1,2}/[0-9]+|[0-9]{4}-[0-9]{2}-[0-9]{2})[[:space:]]*(\\[[A-Za-z]+\\]|[A-Za-z]{2,4}).*TW.*','is')
                    THEN 'valid'
                ELSE 'invalid'
            END AS comment_format
-    FROM FIVETRAN.SALESFORCE.OPPORTUNITY o
-    JOIN FIVETRAN.SALESFORCE.USER    u ON o.LEAD_SALES_ENGINEER_C = u.ID
-    JOIN FIVETRAN.SALESFORCE.ACCOUNT a ON o.ACCOUNT_ID = a.ID
-    WHERE o.IS_DELETED=FALSE AND o.IS_CLOSED=FALSE
-      AND o.AGREEMENT_TYPE_C LIKE 'Capacity%' AND o.TYPE != 'Renewal'
-      AND o.NAME NOT ILIKE '%-Segment%'
-      AND o.TOTAL_ACV_C > 0
-      AND u.NAME IN ('Deborah Awe','James Newsom','Julie Heckman',
+    FROM SNOW_CERTIFIED.SALESFORCE_OPPORTUNITY.DD_SALESFORCE_OPPORTUNITY o
+    WHERE o.IS_SALESFORCE_OPPORTUNITY_DELETED=FALSE AND o.IS_SALESFORCE_OPPORTUNITY_CLOSED=FALSE
+      AND o.SALESFORCE_OPPORTUNITY_AGREEMENT_TYPE LIKE 'Capacity%' AND o.SALESFORCE_OPPORTUNITY_TYPE != 'Renewal'
+      AND o.SALESFORCE_OPPORTUNITY_NAME NOT ILIKE '%-Segment%'
+      AND o.SALESFORCE_OPPORTUNITY_TOTAL_ACV_USD > 0
+      AND o.SALESFORCE_OPPORTUNITY_LEAD_SOLUTION_ENGINEER_NAME IN ('Deborah Awe','James Newsom','Julie Heckman',
                      'Lisa Batteiger','Michael Hughes','Stephen Pace',
                      'Tim Whitaker','Whitney Burke')
 )
